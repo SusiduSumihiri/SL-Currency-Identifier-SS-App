@@ -1,8 +1,6 @@
-import React, { useState, useCallback, useRef } from 'react';
+import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { identifyCurrency } from '../services/geminiService';
 import { useSpeechSynthesis } from '../hooks/useSpeechSynthesis';
-import { fileToBase64 } from '../utils/imageUtils';
-import { CameraIcon } from './icons/CameraIcon';
 import { SpinnerIcon } from './icons/SpinnerIcon';
 
 type Message = {
@@ -10,69 +8,151 @@ type Message = {
     type: 'success' | 'error' | 'info';
 } | null;
 
+// How often to capture a frame from the video to send for analysis
+const SCAN_INTERVAL_MS = 2000;
+// How long to pause scanning after a successful identification
+const POST_DETECTION_PAUSE_MS = 5000;
+
 const CurrencyScanner: React.FC = () => {
-  const [imagePreview, setImagePreview] = useState<string | null>(null);
-  const [message, setMessage] = useState<Message>(null);
-  const [isLoading, setIsLoading] = useState<boolean>(false);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [message, setMessage] = useState<Message>({ text: 'Point your camera at a currency note or coin.', type: 'info' });
+  const [isProcessing, setIsProcessing] = useState<boolean>(false);
+  
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const isProcessingRef = useRef<boolean>(false); // Ref to avoid stale state in interval
+  const lastResultRef = useRef<string | null>(null);
+  
   const { speak } = useSpeechSynthesis();
 
-  const resetState = () => {
-    setImagePreview(null);
-    setMessage(null);
-    setIsLoading(false);
-    if (fileInputRef.current) {
-        fileInputRef.current.value = '';
+  // This function captures a frame, sends it to the API, and handles the result
+  const handleScan = useCallback(async () => {
+    if (!videoRef.current || !canvasRef.current || videoRef.current.readyState < 2 || isProcessingRef.current) {
+      return;
     }
-  };
 
-  const handleImageChange = useCallback(async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
+    isProcessingRef.current = true;
+    setIsProcessing(true);
 
-    resetState();
-    setIsLoading(true);
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const context = canvas.getContext('2d');
 
+    if (!context) {
+      isProcessingRef.current = false;
+      setIsProcessing(false);
+      return;
+    }
+
+    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.9);
+    const base64Image = dataUrl.split(',')[1];
+    
+    if (!base64Image) {
+      isProcessingRef.current = false;
+      setIsProcessing(false);
+      return;
+    }
+
+    let pauseDuration = 0;
     try {
-      const previewUrl = URL.createObjectURL(file);
-      setImagePreview(previewUrl);
-
-      const { base64, mimeType } = await fileToBase64(file);
-      const identificationResult = await identifyCurrency(base64, mimeType);
+      const result = await identifyCurrency(base64Image, 'image/jpeg');
       
-      if (identificationResult === 'FLIP_COIN') {
-          const instructionText = 'This appears to be the emblem side of a coin. Please flip the coin over and try again.';
-          setMessage({ text: instructionText, type: 'info' });
-          speak(instructionText);
-      } else if (identificationResult === 'UNRECOGNIZABLE') {
-          const errorText = 'Could not recognize Sri Lankan currency. Please try again with a clearer image.';
-          setMessage({ text: errorText, type: 'error' });
-          speak(errorText);
-      } else {
-          setMessage({ text: identificationResult, type: 'success' });
-          speak(identificationResult);
+      if (result && result !== lastResultRef.current) {
+        lastResultRef.current = result;
+
+        if (result === 'FLIP_COIN') {
+          const text = 'This appears to be the emblem side of a coin. Please flip the coin over.';
+          setMessage({ text, type: 'info' });
+          speak(text);
+          pauseDuration = POST_DETECTION_PAUSE_MS;
+        } else if (result === 'UNRECOGNIZABLE') {
+           // We don't speak this to avoid being annoying during continuous scanning
+           setMessage({ text: 'Currency not recognized. Please ensure the image is clear.', type: 'info' });
+        } else {
+          setMessage({ text: result, type: 'success' });
+          speak(result);
+          pauseDuration = POST_DETECTION_PAUSE_MS;
+        }
       }
     } catch (err) {
       console.error(err);
-      const errorMessage = 'Identification failed due to a system error. Please try again.';
-      setMessage({ text: errorMessage, type: 'error' });
-      speak(errorMessage);
+      const errorMessage = 'Identification failed due to a system error.';
+      if (lastResultRef.current !== errorMessage) {
+        setMessage({ text: errorMessage, type: 'error' });
+        speak(errorMessage);
+        lastResultRef.current = errorMessage;
+      }
     } finally {
-      setIsLoading(false);
+        setTimeout(() => {
+            isProcessingRef.current = false;
+            setIsProcessing(false);
+            if (pauseDuration > 0) {
+              lastResultRef.current = null; // Allow re-scanning of the same note after pause
+              setMessage({ text: 'Ready to scan again.', type: 'info' });
+            }
+        }, pauseDuration);
     }
   }, [speak]);
+
+  // Effect to set up the camera stream
+  useEffect(() => {
+    let stream: MediaStream | null = null;
+    const enableStream = async () => {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'environment' }
+        });
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+        }
+      } catch (err) {
+        console.error("Error accessing camera: ", err);
+        setMessage({ text: 'Camera access is required. Please enable camera permissions.', type: 'error' });
+      }
+    };
+    enableStream();
+    
+    return () => {
+      stream?.getTracks().forEach(track => track.stop());
+    };
+  }, []);
+
+  // Effect to run the scanning interval
+  useEffect(() => {
+    const interval = setInterval(() => {
+        handleScan();
+    }, SCAN_INTERVAL_MS);
+
+    return () => clearInterval(interval);
+  }, [handleScan]);
+
+  const getMessageStyles = () => {
+      if (!message) return '';
+      switch (message.type) {
+          case 'success':
+              return 'bg-green-900 border-green-700 text-green-300 text-2xl md:text-3xl font-bold';
+          case 'error':
+              return 'bg-red-900 border-red-700 text-red-300 text-xl';
+          case 'info':
+          default:
+              return 'bg-cyan-800 border-cyan-600 text-cyan-200 text-xl';
+      }
+  };
 
   return (
     <div className="w-full flex flex-col items-center p-6 bg-gray-800 rounded-2xl shadow-lg border border-gray-700">
       <div className="w-full aspect-video bg-gray-700 rounded-lg flex items-center justify-center mb-6 overflow-hidden relative">
-        {imagePreview && <img src={imagePreview} alt="Currency preview" className="object-contain w-full h-full" />}
-        {!imagePreview && !isLoading && (
-          <div className="text-gray-400 flex flex-col items-center">
-            <CameraIcon className="w-16 h-16 mb-2" />
-            <span className="text-lg">Image preview will appear here</span>
-          </div>
-        )}
-        {isLoading && (
+        <video
+          ref={videoRef}
+          autoPlay
+          playsInline
+          muted
+          className="w-full h-full object-cover"
+          aria-label="Live camera feed for currency identification"
+        />
+        {isProcessing && (
           <div className="absolute inset-0 bg-black bg-opacity-60 flex flex-col items-center justify-center">
             <SpinnerIcon className="w-12 h-12 text-cyan-400" />
             <p className="mt-4 text-lg font-semibold">Identifying...</p>
@@ -80,49 +160,20 @@ const CurrencyScanner: React.FC = () => {
         )}
       </div>
 
-      {message && !isLoading && (
-        <div className={`text-center my-4 p-4 rounded-lg w-full border ${
-            message.type === 'success' ? 'bg-green-900 border-green-700' :
-            message.type === 'error' ? 'bg-red-900 border-red-700' :
-            'bg-amber-800 border-amber-600'
-        }`}>
-            <p className={`font-semibold ${
-                message.type === 'success' ? 'text-2xl md:text-3xl font-bold text-green-300' :
-                message.type === 'error' ? 'text-xl text-red-300' :
-                'text-xl text-amber-200'
-            }`}>{message.text}</p>
-        </div>
-      )}
-
-      <div className="w-full mt-4">
-        <input
-          type="file"
-          accept="image/*"
-          capture="environment"
-          onChange={handleImageChange}
-          className="hidden"
-          id="currency-input"
-          ref={fileInputRef}
-          disabled={isLoading}
-        />
-        {message || imagePreview ? (
-             <button
-                onClick={resetState}
-                className="w-full text-lg font-bold py-4 px-6 bg-gray-600 hover:bg-gray-500 text-white rounded-xl transition-all duration-300 focus:outline-none focus:ring-4 focus:ring-gray-400 disabled:bg-gray-700 disabled:cursor-not-allowed"
-                disabled={isLoading}
-              >
-                Identify Another
-            </button>
-        ) : (
-            <label
-              htmlFor="currency-input"
-              className={`w-full flex items-center justify-center text-lg font-bold py-4 px-6 rounded-xl transition-all duration-300 focus:outline-none focus:ring-4 ${isLoading ? 'bg-cyan-800 text-gray-400 cursor-not-allowed' : 'bg-cyan-600 hover:bg-cyan-500 text-white cursor-pointer focus:ring-cyan-400'}`}
-            >
-              <CameraIcon className="w-6 h-6 mr-3" />
-              Tap to Identify Currency
-            </label>
+      <div 
+        aria-live="assertive" 
+        aria-atomic="true"
+        className="w-full h-24 flex items-center justify-center" // Fixed height to prevent layout shifts
+      >
+        {message && (
+          <div className={`text-center p-4 rounded-lg w-full border transition-all duration-300 ${getMessageStyles()}`}>
+              <p className="font-semibold">{message.text}</p>
+          </div>
         )}
       </div>
+
+      {/* Hidden canvas for capturing frames from the video */}
+      <canvas ref={canvasRef} className="hidden" aria-hidden="true" />
     </div>
   );
 };
