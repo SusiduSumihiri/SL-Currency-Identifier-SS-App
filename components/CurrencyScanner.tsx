@@ -2,11 +2,14 @@ import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { identifyCurrency } from '../services/geminiService';
 import { useSpeechSynthesis } from '../hooks/useSpeechSynthesis';
 import { SpinnerIcon } from './icons/SpinnerIcon';
+import { CameraOffIcon } from './icons/CameraOffIcon';
 
 type Message = {
     text: string;
     type: 'success' | 'error' | 'info';
 } | null;
+
+type CameraPermission = 'pending' | 'granted' | 'denied';
 
 // How often to capture a frame from the video to send for analysis
 const SCAN_INTERVAL_MS = 2000;
@@ -16,6 +19,7 @@ const POST_DETECTION_PAUSE_MS = 5000;
 const CurrencyScanner: React.FC = () => {
   const [message, setMessage] = useState<Message>({ text: 'Point your camera at a currency note or coin.', type: 'info' });
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
+  const [cameraPermission, setCameraPermission] = useState<CameraPermission>('pending');
   
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -107,9 +111,17 @@ const CurrencyScanner: React.FC = () => {
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
         }
+        setCameraPermission('granted');
+        setMessage({ text: 'Point your camera at a currency note or coin.', type: 'info' });
       } catch (err) {
         console.error("Error accessing camera: ", err);
-        setMessage({ text: 'Camera access is required. Please enable camera permissions.', type: 'error' });
+        if (err instanceof Error && (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError')) {
+            setCameraPermission('denied');
+            setMessage({ text: 'Camera access denied. Please enable it in your browser settings to use the scanner.', type: 'error' });
+        } else {
+            setCameraPermission('denied');
+            setMessage({ text: 'Could not access camera. Please ensure it is not in use by another application.', type: 'error' });
+        }
       }
     };
     enableStream();
@@ -121,12 +133,16 @@ const CurrencyScanner: React.FC = () => {
 
   // Effect to run the scanning interval
   useEffect(() => {
+    if (cameraPermission !== 'granted') {
+      return; // Don't start scanning if camera isn't ready
+    }
+
     const interval = setInterval(() => {
         handleScan();
     }, SCAN_INTERVAL_MS);
 
     return () => clearInterval(interval);
-  }, [handleScan]);
+  }, [handleScan, cameraPermission]);
 
   const getMessageStyles = () => {
       if (!message) return '';
@@ -144,19 +160,35 @@ const CurrencyScanner: React.FC = () => {
   return (
     <div className="w-full flex flex-col items-center p-6 bg-gray-800 rounded-2xl shadow-lg border border-gray-700">
       <div className="w-full aspect-video bg-gray-700 rounded-lg flex items-center justify-center mb-6 overflow-hidden relative">
-        <video
-          ref={videoRef}
-          autoPlay
-          playsInline
-          muted
-          className="w-full h-full object-cover"
-          aria-label="Live camera feed for currency identification"
-        />
-        {isProcessing && (
-          <div className="absolute inset-0 bg-black bg-opacity-60 flex flex-col items-center justify-center">
-            <SpinnerIcon className="w-12 h-12 text-cyan-400" />
-            <p className="mt-4 text-lg font-semibold">Identifying...</p>
-          </div>
+        {cameraPermission === 'granted' && (
+          <>
+            <video
+              ref={videoRef}
+              autoPlay
+              playsInline
+              muted
+              className="w-full h-full object-cover"
+              aria-label="Live camera feed for currency identification"
+            />
+            {isProcessing && (
+              <div className="absolute inset-0 bg-black bg-opacity-60 flex flex-col items-center justify-center">
+                <SpinnerIcon className="w-12 h-12 text-cyan-400" />
+                <p className="mt-4 text-lg font-semibold">Identifying...</p>
+              </div>
+            )}
+          </>
+        )}
+        {cameraPermission === 'pending' && (
+            <div className="flex flex-col items-center justify-center text-gray-400">
+                <SpinnerIcon className="w-10 h-10 mb-4" />
+                <p>Initializing camera...</p>
+            </div>
+        )}
+        {cameraPermission === 'denied' && (
+             <div className="flex flex-col items-center justify-center text-red-400 p-4">
+                <CameraOffIcon className="w-12 h-12 mb-4" />
+                <p className="text-center font-semibold text-lg">Camera Access Required</p>
+             </div>
         )}
       </div>
 
