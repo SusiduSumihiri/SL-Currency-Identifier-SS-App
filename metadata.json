@@ -1,0 +1,7 @@
+{
+  "name": "SL Currency Identifier SS App",
+  "description": "An application designed to assist visually impaired individuals in recognizing Sri Lankan currency notes and coins using their device's camera.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
